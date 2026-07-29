@@ -17,7 +17,7 @@ The system uses a relational-document hybrid approach. Postgres is used for rela
 ```sql
 
 -- Enums
-CREATE TYPE entry_type AS ENUM ('note', 'task', 'project', 'quarter', 'habit');
+CREATE TYPE entry_type AS ENUM ('note', 'task', 'project', 'quarter', 'habit', 'activity', 'bucket');
 CREATE TYPE entry_status AS ENUM ('backlog', 'todo', 'in_progress', 'completed', 'archived');
 CREATE TYPE trigger_type AS ENUM ('time', 'location');
 
@@ -160,6 +160,22 @@ The `FinanceService` is a stateless service built on top of the dynamic tables s
 - Uses the `logs` table to track every interaction (habit completion, spending, energy levels).
 - **Correlation**: Queries join `logs` and `entry_tags` to analyze cross-domain data (e.g., "Do high-energy days lead to more impulse spending?").
 
+### D. Activity Tracking & Timers
+
+The `ActivityService` manages activity categories and logs time spent on activities using `entries` of `type = 'activity'`.
+
+**Data schema** (stored inside the `data` JSONB column):
+```json
+{
+  "time_entries": [
+    { "date": "2026-07-28T23:50:00Z", "duration": 3600 }
+  ],
+  "total_duration": 3600
+}
+```
+- `time_entries`: Array of recorded time session logs containing UTC `date` and `duration` (in seconds).
+- `total_duration`: Running cumulative total duration across all logged sessions.
+
 ## 5. Technical Recommendations
 - **Database**: PostgreSQL (Supabase recommended for Auth/Real-time).
 - **Frontend**: Web (React/Next.js) with TanStack Table for the dynamic table UI.
@@ -172,6 +188,7 @@ The `internal/application` package builds business logic and workflows on top of
 - **Task Management**: A service to validate, create, and update tasks leveraging the underlying `store.Entry` structure. Includes default status assignments.
 - **Project Management**: A service to validate, create, and update projects. Enforces the `project` entry type, validates that the title is present, defaults status to `todo`, and defaults scheduled dates to `now`.
 - **Quarter Planning**: A service to validate, create, and update quarterly plans. Enforces the `quarter` entry type, validates that the title is present, defaults status to `todo`, and defaults scheduled dates to `now`.
+- **Activity Tracking**: A service to create, query, delete, and log time sessions to activity categories (`type = 'activity'`). Appends session duration to the JSONB `time_entries` array and updates `total_duration`.
 
 ## 7. API Architecture & Contracts
 
@@ -209,4 +226,24 @@ The backend utilizes a generic HTTP handler system mapping `PUT`, `GET`, and `DE
   }
   ```
   *(Note: For GET requests, the payload is typically passed as a URL-encoded JSON string in the `data` query parameter: `?action=journal.timerange&data={...}`)*
+
+**Activity API Example:**
+- **PUT `action: "activity"`**: Creates or updates an activity entry.
+- **PUT `action: "activity.add_time_entry"`**: Appends a time session log to an activity by `id` or `title` (creates activity if missing).
+  ```json
+  {
+    "action": "activity.add_time_entry",
+    "data": {
+      "id": "<optional_uuid>",
+      "title": "Gym",
+      "entry": {
+        "date": "2026-07-28T23:50:00Z",
+        "duration": 3600
+      }
+    }
+  }
+  ```
+- **GET `action: "activity.list"`**: Retrieves all activity entries.
+- **DELETE `action: "activity"`**: Deletes an activity entry by ID.
+
 """
