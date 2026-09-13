@@ -17,72 +17,27 @@ The system uses a relational-document hybrid approach. Postgres is used for rela
 ```sql
 
 -- Enums
-CREATE TYPE entry_type AS ENUM ('note', 'task', 'project', 'quarter', 'habit', 'activity', 'bucket');
-CREATE TYPE entry_status AS ENUM ('backlog', 'todo', 'in_progress', 'completed', 'archived');
-CREATE TYPE trigger_type AS ENUM ('time', 'location');
+CREATE TYPE entry_type AS ENUM ('note', 'journal', 'activity', 'bucket', 'project', 'habit', 'task');
 
 -- 1. Core Entries Table
 CREATE TABLE entries (
     id UUID PRIMARY KEY,
-    type entry_type NOT NULL,
     parent_id UUID REFERENCES entries(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
-    content TEXT, -- Markdown body
-    status entry_status DEFAULT 'backlog',
-    progress INTEGER DEFAULT 0,
-    deadline_at TIMESTAMPTZ,
-    scheduled_at TIMESTAMPTZ,
+    content TEXT,
+    type entry_type NOT NULL,
+    data JSONB, -- Flexible store for type-specific fields
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 2. Notification Triggers
-CREATE TABLE triggers (
-    id UUID PRIMARY KEY,
-    entry_id UUID NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    type trigger_type NOT NULL,
-    config JSONB NOT NULL, -- { "time": "09:00", "repeat": "daily" } or { "lat": x, "lng": y, "radius": 100 }
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+CREATE INDEX idx_entries_parent ON entries (parent_id);
+CREATE INDEX idx_entries_type ON entries (type);
+CREATE INDEX idx_entries_journal_date
+    ON entries ((data->>'journal_date'), created_at DESC)
+    WHERE type = 'journal';
 
--- 3. Dynamic Table System (Notion-lite)
-CREATE TABLE table_definitions (
-    id UUID PRIMARY KEY,
-    name TEXT NOT NULL,
-    columns JSONB NOT NULL, -- Array: [{"name": "Price", "type": "currency"}, {"name": "Status", "type": "select"}]
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE table_rows (
-    id UUID PRIMARY KEY,
-    table_def_id UUID NOT NULL REFERENCES table_definitions(id) ON DELETE CASCADE,
-    data JSONB NOT NULL, -- Key-value pairs: {"Price": 15.99, "Service": "Netflix"}
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- 4. Analytics Logs (For Plotting Conclusions)
-CREATE TABLE logs (
-    id UUID PRIMARY KEY,
-    entry_id UUID REFERENCES entries(id) ON DELETE SET NULL,
-    event_type TEXT NOT NULL, -- e.g., 'task_completed', 'finance_added'
-    numeric_value DECIMAL, -- For charting
-    metadata JSONB,
-    logged_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- 5. Taxonomy
-CREATE TABLE tags (
-    id UUID PRIMARY KEY,
-    label TEXT UNIQUE NOT NULL
-);
-
-CREATE TABLE entry_tags (
-    entry_id UUID REFERENCES entries(id) ON DELETE CASCADE,
-    tag_id UUID REFERENCES tags(id) ON DELETE CASCADE,
-    PRIMARY KEY (entry_id, tag_id)
-);
+-- Enable Row Level Security (RLS) to resolve Supabase security warnings
+ALTER TABLE entries ENABLE ROW LEVEL SECURITY;
 ```
 
 ## 4. Key Feature Implementation Details
