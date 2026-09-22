@@ -1,92 +1,85 @@
-# Tasks Feature Implementation Plan
+# Tasks Feature Implementation Plan & Architecture
 
 ## 1. Overview
-The Tasks page will serve as the central hub for managing tasks, structured into a two-column layout:
-- **Main Content Area**: Displays the currently selected list of tasks (Today, Weekly, Shopping, or Inbox) along with a progress bar and an "Add a task" button.
-- **Sidebar Navigation**: Contains links (or buttons) to switch views between "This week", "Shopping", and "Inbox", complete with their own progress summaries where applicable.
+The Tasks feature serves as the central hub for managing tasks, structured into a two-column responsive layout:
+- **Sidebar Navigation (`components/tasks/Sidebar.tsx`)**: Quick switcher for filtering tasks by category (*Today*, *This Week*, and *Inbox*), along with progress summaries.
+- **Main Content Area**: Displays the filtered list of tasks along with an overall progress bar, inline task creation, completion toggles, and detail overlay modals.
 
-All task data will rely on the `entries` table using `type = "task"`.
-
----
-
-## 2. Timezone & Data Strategy
-Since the database stores timestamps in **UTC** and the UI works in **local time**, all time-based queries will be calculated on the client to get the exact local time bounds, which are then converted to UTC for the backend request.
-
-**Example for "Today's Tasks":**
-1. Get start of today (e.g., `00:00:00` local).
-2. Get end of today (e.g., `23:59:59` local).
-3. Convert both to UTC using `.toISOString()`.
-4. Send to backend: `GET /api/tasks?scheduled_start=<utc_start>&scheduled_end=<utc_end>`.
+All task data relies on the unified `entries` table using `type = "task"`.
 
 ---
 
-## 3. UI Layout & Routing
-To support seamless navigation and URL sharing, we will use query parameters or sub-routes to control the main view.
-
-- **`/tasks`** (or `?view=today`): Shows Today's Tasks.
-- **`/tasks?view=weekly`**: Shows Weekly Tasks.
-- **`/tasks?view=shopping`**: Shows Shopping Tasks.
-- **`/tasks?view=inbox`**: Shows the Inbox.
-
-### Sidebar Navigation
-- **This Week**: Links to `?view=weekly`. Shows a progress bar based on tasks scheduled this week.
-- **Shopping**: Queries for tasks containing the "shopping" tag (via `entry_tags` / tag system). If > 0, renders a button linking to `?view=shopping` with a progress bar.
-- **Inbox**: Links to `?view=inbox`.
+## 2. Timezone & Date Strategy
+The database stores all timestamps in **UTC**, while the frontend works in the user's **local timezone**.
+- The client calculates the start and end of the local time window (e.g. today from `00:00:00` to `23:59:59`).
+- Bounds are formatted as ISO UTC strings (`.toISOString()`).
+- Requests are dispatched to the backend via `GET /api/get?action=task.timerange&data={"startDate":"...","endDate":"..."}`.
+- Overdue tasks are retrieved via `action: "task.overdue_timerange"`, which pulls both tasks scheduled for the window and past uncompleted tasks.
 
 ---
 
-## 4. Main Views Breakdown
+## 3. Supported Views
 
-### A. Today's Tasks (Default View)
-- **Query**: Fetch tasks where `ScheduledAt` falls within the local "today" (converted to UTC). 
-- **Header**: "Today's Tasks" alongside a Progress Bar.
-- **Progress Calculation**: `(Completed Tasks Today) / (Total Tasks Scheduled Today) * 100`.
-- **List**: Renders tasks using the `Lightweight Task Component`.
-- **Footer**: "Add a task" inline button to quickly append a new task to today's list.
+### A. Today's Tasks
+- **Query**: Tasks scheduled for the current calendar date (plus past overdue tasks).
+- **Header**: "Today's Tasks" with completion progress percentage.
+- **List**: Renders tasks with checkbox completion toggle, priority tag, and title.
+- **Actions**: Quick addition of new tasks with default scheduled date set to today.
 
-### B. Weekly Tasks
-- **Query**: Fetch tasks where `ScheduledAt` falls between this week's Monday and Sunday (local bounds converted to UTC).
-- **Header**: "This Week's Tasks" with Progress Bar.
-- **List & Footer**: Same structure as Today's Tasks.
+### B. This Week's Tasks
+- **Query**: Tasks scheduled between Monday and Sunday of the active week.
+- **Header**: "This Week's Tasks" with weekly progress bar.
 
-### C. Shopping
-- **Query**: Fetch tasks that have a relation in the tag system with the tag name "shopping".
-- **Header**: "Shopping List" with Progress Bar.
-- **List & Footer**: Same structure as Today's Tasks.
-
-### D. Inbox
-- **Query**: Fetch all tasks (regardless of date) but exclude tasks where `status = 'archived'`.
+### C. Inbox
+- **Query**: All active tasks regardless of date (`action: "task.inbox"`), excluding archived tasks.
 - **Header**: "Inbox".
-- **Layout**: Renders the reusable `KanbanBoard` component.
-  - Passes the fetched tasks to the board.
-  - The board manages columns based on `entry_status` (Backlog, Todo, In Progress, Completed).
 
 ---
 
-## 5. Reusable Components
+## 4. Components
 
-### A. Lightweight Task Component (`TaskListItem`)
-- **Purpose**: The default item shown in lists.
-- **Visuals**: Behaves as a clickable button/row. Shows Title, Scheduled Time, and Priority.
-- **Interactions**: 
-  - Clicking opens the `TaskOverlay` component.
-  - Can handle auto-saving if inline quick-edits (like toggling status) are supported.
+### A. Task Item
+- Displays completion checkbox, title, priority badge, and schedule indicator.
+- Clicking any task opens the `TaskOverlay` modal for full editing.
+- Completing a parent task automatically updates its status to `completed`.
 
-### B. Overlay Task Component (`TaskOverlay`)
-- **Purpose**: A detailed, centered Modal dialog layered over the main screen.
-- **Fields**: 
-  - Editable Title
-  - Editable Content (Description)
-  - Priority Selector (Saved within the `metadata` JSONB column, e.g., `{"priority": "high"}`).
-  - Scheduled Date/Time Picker
-  - Child Tasks (sub-tasks rendered as clickable buttons)
-  - Status/Other details
-- **Auto-Saving**: Any change to title, content, priority, etc., triggers a debounced auto-save to the backend, similar to the Journal component.
+### B. Task Modal (`TaskOverlay`)
+- **Title**: Inline editable title.
+- **Content**: Detailed Markdown notes/description.
+- **Priority Selector**: Low, Medium, High (stored in `entry.data.priority`).
+- **Schedule**: Date and time selector (stored in `entry.data.scheduled_at`).
+- **Child Subtasks**:
+  - List of child tasks where `parent_id == task.id`.
+  - Inline completion toggle for subtasks.
+  - "Add subtask" button opening `NewChildOverlay`.
+  - Automatic completion rollup: parent task progress updates as subtasks are finished.
 
-### C. Kanban Board Component (`KanbanBoard`)
-- **Purpose**: A reusable board component that organizes tasks into columns based on their `status`.
-- **Functionality**:
-  - Displays dynamic columns (e.g., Backlog, Todo, In Progress, Completed).
-  - Uses the `TaskListItem` or a specific board-card component for individual tasks.
-  - (Optional but recommended) Supports drag-and-drop to easily change the status of a task.
-  - Handles updating the task status via the API when moved between columns.
+### C. Add Subtask Dialog (`NewChildOverlay`)
+- Clean modal allowing rapid entry of subtask title.
+- Automatically links `parent_id` to the parent task.
+
+---
+
+## 5. Data Model (`TaskEntry` & `TaskData`)
+
+```typescript
+export type TaskData = {
+  status?: "backlog" | "todo" | "in_progress" | "completed" | "archived";
+  progress?: number;
+  scheduled_at?: string | null;
+  deadline_at?: string | null;
+  completed_at?: string | null;
+  priority?: "low" | "medium" | "high";
+};
+
+export type TaskEntry = {
+  id: string;
+  type: string;
+  parent_id?: string | null;
+  title: string;
+  content?: string;
+  data?: TaskData;
+  created_at: string;
+  children?: TaskEntry[];
+};
+```

@@ -1,21 +1,19 @@
-```python?code_reference&code_event_index=2
-content = """# Project Context: Unified Productivity System (Second Brain)
+# Project Context: Unified Productivity System (Second Brain)
 
 ## 1. Project Overview
-A custom, unified "Second Brain" designed to replace Notion, Todoist, and Apple Reminders. The core purpose is to centralize notes, tasks, quarterly planning, and financial tracking into a single relational database to allow for cross-domain data analysis and "conclusion drawing" (e.g., correlating spending with productivity or mood).
+A custom, unified "Second Brain" designed to replace Notion, Todoist, and Apple Reminders. The core purpose is to centralize notes, tasks, projects, quarterly planning, and daily reflections into a single relational database with an intuitive, minimalist user interface.
 
 ## 2. Core Philosophy: Unified Entity Model
 Instead of siloed tables for tasks, notes, and projects, the system uses a **Node-based hierarchy**:
-- **Everything is an `Entry`**: A Note, Task, Project, or Quarter is simply a different `type` of the same entity.
+- **Everything is an `Entry`**: A Note, Task, Project, Journal, Daily Note, Activity, or Quarter is simply a different `type` of the same entity.
 - **Recursive Hierarchy**: Entries use a `parent_id` to allow infinite nesting (e.g., Quarter > Project > Task > Sub-task).
-- **Polymorphic Triggers**: Triggers (Time/Location) are detached logic that can be associated with any Entry.
+- **Flexible JSONB Data**: Type-specific attributes are stored within the `data` JSONB column, avoiding schema migrations for new attributes.
 
 ## 3. Database Architecture (PostgreSQL)
-The system uses a relational-document hybrid approach. Postgres is used for relational integrity, while **JSONB** is used for dynamic, Notion-like table features.
+The database uses a relational-document hybrid approach: PostgreSQL provides relational integrity and cascading parent-child deletions, while **JSONB** allows flexible attributes.
 
-### SQL Schema
+### SQL Schema (`init.sql`)
 ```sql
-
 -- Enums
 CREATE TYPE entry_type AS ENUM ('note', 'journal', 'activity', 'bucket', 'project', 'habit', 'task');
 
@@ -40,86 +38,37 @@ CREATE INDEX idx_entries_journal_date
 ALTER TABLE entries ENABLE ROW LEVEL SECURITY;
 ```
 
-## 4. Key Feature Implementation Details
+---
 
-### A. Location & Time Triggers
+## 4. Entity Types & Data Schemas
 
-#### Time Trigger Implementation
+### A. Tasks (`type = 'task'`)
+Tasks represent actionable items that can be scheduled, organized by status, prioritized, and nested under projects or parent tasks.
 
-Time triggers are evaluated by `TriggerService.EvaluateAllTriggers()`, which is called on a schedule (every minute via a ticker). All firing logic is derived purely from the `TimeConfig` — there is no stored state like `next_run` or `last_fired`.
-
-**Config schema** (JSONB stored as string):
+**`data` JSONB Structure:**
 ```json
-{ "time": "<UTC timestamp>", "repeat": 60 }
-```
-- `time`: The UTC timestamp of the first (or only) firing. Stored and compared in UTC.
-- `repeat`: Interval in minutes for recurring triggers. Set to `0` for a one-shot trigger.
-
-**Firing algorithm** (`ShouldFireTimeTrigger`):
-- **Tolerance window**: ±5 minutes around any target firing time. The scheduler runs every minute, so this window ensures a trigger is never missed.
-- **One-shot** (`repeat == 0`): Fires if `|now - config.time| ≤ 5 minutes`. Deactivated (`is_active = false`) after firing.
-- **Recurring** (`repeat > 0`): Fires if `(now - config.time) % repeat ≤ 5 minutes`, i.e., if the current time falls within the tolerance window of the config time or any of its repeat boundaries. Remains active after firing.
-
-**Timezone handling**: All timestamps are stored and compared in UTC. The client is responsible for converting their local time to UTC before creating a trigger.
-
-#### Location Trigger Implementation
-
-Location triggers use geofencing to fire a notification when the user enters a defined radius around a point. They are always **one-shot** — once fired, the trigger is deactivated (`is_active = false`) to avoid repeatedly pinging the user while they remain at the location.
-
-**Config schema** (JSONB stored as string):
-```json
-{ "lat": 51.5033, "lng": -0.1196, "radius": 500 }
-```
-- `lat` / `lng`: GPS coordinates of the target location.
-- `radius`: Geofence radius in meters.
-
-**Firing algorithm** (`IsWithinRadius`):
-- Uses the **Haversine formula** to calculate the great-circle distance between the user's current position (from `LocationService`) and the config coordinates.
-- Fires if `haversineDistance(current, config) ≤ radius`.
-- After firing, the trigger is deactivated. To re-arm, the user must create a new trigger.
-
-### B. Dynamic Tables (Finances/Subscriptions)
-- **Schema-less Rows**: The `table_rows.data` JSONB column stores user-defined fields.
-- **Column Validation**: `TableRow.Save()` validates that every key in the row data matches a column defined in the parent `TableDefinition`. `TableDefinition.Save()` validates that every column has a non-empty `name` field.
-- **Formulas**: Stored as strings in `table_definitions.columns` (e.g., `"{Cost} * 1.15"`) and parsed on the frontend using a math parser (like math.js).
-- **Rollups**: SQL aggregation queries are used to sum/average JSONB fields for quarterly reviews.
-
-#### Finance (Budget Tracking)
-
-The `FinanceService` is a stateless service built on top of the dynamic tables system. It manages budget buckets and tracks spending via transaction logs.
-
-**Budget Table** — a `TableDefinition` with name "Budget" and default columns:
-```json
-[{"name": "Bucket", "type": "string"}, {"name": "Amount", "type": "int"}, {"name": "Spent", "type": "int"}]
+{
+  "status": "todo",         // "backlog" | "todo" | "in_progress" | "completed" | "archived"
+  "priority": "high",       // "low" | "medium" | "high"
+  "scheduled_at": "2026-09-13T12:00:00Z",
+  "deadline_at": null,
+  "completed_at": null,
+  "progress": 0
+}
 ```
 
-**BucketData schema** — typed struct used for validation and (de)serialization of budget rows:
-- `Bucket` (string, required): Category name (e.g., "Restaurants", "Coffee")
-- `Amount` (float64, required, > 0): Budgeted amount for the period
-- `Spent` (float64, defaults to 0): Running total of spending
+### B. Projects (`type = 'project'`)
+Projects group related tasks and notes together. Child entries reference the project ID via `parent_id`.
+- Automatic progress rollup calculates the percentage of completed tasks under a project.
 
-**Transactions** are stored as `Log` entries with:
-- `event_type`: `"finance_transaction"`
-- `numeric_value`: Transaction amount
-- `metadata`: `{"bucket": "Coffee", "budgetId": "<table_def_id>"}`. If `budgetId` is present, the matching bucket row's `Spent` is incremented.
+### C. Journal Entries (`type = 'journal'`)
+Daily reflection entries. The `data` JSONB column stores `"journal_date": "YYYY-MM-DD"`, which is indexed for rapid date-range retrieval.
 
-**Key methods**:
-- `CreateBudgetTable(td)` — creates the budget table definition with defaults
-- `AddBucket(tr)` — validates via `BucketData.Validate()`, normalizes, and saves
-- `AddTransaction(log)` — saves the log, then updates the matching bucket's `Spent`
-- `Reset(budgetTableId)` — sets `Spent = 0` on all rows in the budget table
+### D. Daily Notes (`type = 'note'`)
+Quick daily scratchpad notes associated with a specific date.
 
-**Design**: The service is fully stateless — all IDs (budget table, bucket) are passed by the caller. No state is stored on the `FinanceService` struct.
-
-### C. The "Insight" Engine
-- Uses the `logs` table to track every interaction (habit completion, spending, energy levels).
-- **Correlation**: Queries join `logs` and `entry_tags` to analyze cross-domain data (e.g., "Do high-energy days lead to more impulse spending?").
-
-### D. Activity Tracking & Timers
-
-The `ActivityService` manages activity categories and logs time spent on activities using `entries` of `type = 'activity'`.
-
-**Data schema** (stored inside the `data` JSONB column):
+### E. Activity Tracking (`type = 'activity'`)
+Tracks time spent on activity categories.
 ```json
 {
   "time_entries": [
@@ -128,77 +77,68 @@ The `ActivityService` manages activity categories and logs time spent on activit
   "total_duration": 3600
 }
 ```
-- `time_entries`: Array of recorded time session logs containing UTC `date` and `duration` (in seconds).
-- `total_duration`: Running cumulative total duration across all logged sessions.
 
-## 5. Technical Recommendations
-- **Database**: PostgreSQL (Supabase recommended for Auth/Real-time).
-- **Frontend**: Web (React/Next.js) with TanStack Table for the dynamic table UI.
-- **Plotting**: Recharts or D3.js for visual data analysis.
-- **Sync**: Use an append-only log strategy for any changes meant to be plotted over time.
+---
 
-## 6. Application Layer Features
-The `internal/application` package builds business logic and workflows on top of the generic `store` layer.
-- **Daily Journaling**: A service to quickly generate daily reflections. Creates a `note` type Entry automatically marked as `completed`. Can optionally link to a habit entry (e.g., "Daily Journaling" habit) to track streaks.
-- **Task Management**: A service to validate, create, and update tasks leveraging the underlying `store.Entry` structure. Includes default status assignments.
-- **Project Management**: A service to validate, create, and update projects. Enforces the `project` entry type, validates that the title is present, defaults status to `todo`, and defaults scheduled dates to `now`.
-- **Quarter Planning**: A service to validate, create, and update quarterly plans. Enforces the `quarter` entry type, validates that the title is present, defaults status to `todo`, and defaults scheduled dates to `now`.
-- **Activity Tracking**: A service to create, query, delete, and log time sessions to activity categories (`type = 'activity'`). Appends session duration to the JSONB `time_entries` array and updates `total_duration`.
+## 5. Application Layer Services
 
-## 7. API Architecture & Contracts
+The backend (`internal/application`) encapsulates domain logic around the unified `store`:
+- **`TaskService`**: Task creation, date-range queries (`task.timerange`, `task.overdue_timerange`), inbox listing, and cascade deletion.
+- **`ProjectService`**: Project portfolio management, fetching child tasks and notes (`project.children`), and progress tracking.
+- **`JournalService`**: Saving and querying reflections across date ranges.
+- **`DailyNotesService`**: Fast note creation and date-based retrieval.
+- **`NoteService`**: General note management.
+- **`ActivityService`**: Activity logging and duration aggregation.
 
-The backend utilizes a generic HTTP handler system mapping `PUT`, `GET`, and `DELETE` requests to specific service methods via action strings.
+---
 
-**Generic Request Format:**
+## 6. API Architecture & Action Contracts
+
+The backend provides a unified HTTP dispatcher where requests are routed using an `action` string:
+- `POST /api/put`
+- `GET /api/get`
+- `DELETE /api/delete`
+- `GET /health`
+
+### Request Examples
+
+#### 1. Save / Update Task (`POST /api/put`)
 ```json
 {
-  "action": "<feature_name>",
-  "data": { ... }
+  "action": "task",
+  "data": {
+    "entry": {
+      "type": "task",
+      "title": "Review pull request",
+      "parent_id": "<optional_parent_id>",
+      "data": {
+        "status": "in_progress",
+        "priority": "medium",
+        "scheduled_at": "2026-09-13T12:00:00Z"
+      }
+    }
+  }
 }
 ```
 
-**Journal API Example:**
-- **PUT `action: "journal"`**: Creates or updates a daily journal entry.
-  ```json
-  {
-    "action": "journal",
-    "data": {
-      "entry": {
-        "id": "<optional_uuid>",
-        "content": "<journal entry text>"
-      }
-    }
-  }
-  ```
-- **GET `action: "journal.timerange"`**: Retrieves journal entries within a specific timeframe.
-  ```json
-  {
-    "action": "journal.timerange",
-    "data": {
-      "startDate": "2023-01-01T00:00:00Z",
-      "endDate": "2023-12-31T23:59:59Z"
-    }
-  }
-  ```
-  *(Note: For GET requests, the payload is typically passed as a URL-encoded JSON string in the `data` query parameter: `?action=journal.timerange&data={...}`)*
+#### 2. Query Tasks by Date Range (`GET /api/get`)
+```
+GET /api/get?action=task.timerange&data={"startDate":"2026-09-13T00:00:00Z","endDate":"2026-09-13T23:59:59Z"}
+```
 
-**Activity API Example:**
-- **PUT `action: "activity"`**: Creates or updates an activity entry.
-- **PUT `action: "activity.add_time_entry"`**: Appends a time session log to an activity by `id` or `title` (creates activity if missing).
-  ```json
-  {
-    "action": "activity.add_time_entry",
-    "data": {
-      "id": "<optional_uuid>",
-      "title": "Gym",
-      "entry": {
-        "date": "2026-07-28T23:50:00Z",
-        "duration": 3600
-      }
-    }
-  }
-  ```
-- **GET `action: "activity.list"`**: Retrieves all activity entries.
-- **DELETE `action: "activity"`**: Deletes an activity entry by ID.
+#### 3. Fetch Project Children (`GET /api/get`)
+```
+GET /api/get?action=project.children&data={"id":"<project_uuid>"}
+```
 
-"""
+---
+
+## 7. Technology Stack Summary
+
+| Component | Technology |
+|---|---|
+| **Database** | PostgreSQL 15+ (Supabase compatible) |
+| **Backend** | Go 1.23+, Standard Library `net/http`, `log/slog` |
+| **Frontend** | Next.js 15+ (App Router), TypeScript, Tailwind CSS v4, TipTap |
+| **Mobile** | React Native / Expo (in `assistant-mobile`) |
+| **Deployment** | Docker Compose for local development; Vercel (UI), Railway/Render (API), Neon/Supabase (DB) for production |
